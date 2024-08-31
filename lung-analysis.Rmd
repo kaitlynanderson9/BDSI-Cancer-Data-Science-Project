@@ -1,0 +1,644 @@
+---
+title: "CDS_BDSI_Project_GGKADY"
+date: "2024-07-10"
+output: html_document
+---
+BDSI Cancer Data Science Project
+
+
+Data Cleaning & Preparation
+```{r setup, include=FALSE}
+library(survival)
+library(ranger)
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(survminer)
+library(glmnet)
+library(tidyr)
+library(rjags)
+library(afthd)
+library(penAFT)
+
+#Load lung meta data
+lungMeta<-read.csv("newLungKData.csv")
+lungMeta
+
+#filter image with most cells per patient
+lungMeta
+modData <- lungMeta %>%
+  group_by(patient_id) %>%
+  slice(which.max(totalCell)) %>%
+  ungroup()
+
+#recode demographic variables
+#mhcII <- mchII_status
+# 0-low, 1-high
+
+#gender_1 <- gender
+# 0- male, 1- female
+
+
+modData1 <- modData %>%
+  mutate(mchII= case_when(mhcII_status=="low" ~ 0,
+                          mhcII_status=="high" ~ 1),
+         gender_1= case_when(gender=="F" ~ 0,
+                             gender=="M" ~ 1),
+         age_at_diagnosis = as.numeric(age_at_diagnosis), 
+         stage_new = case_when(stage_numeric==1 ~ "1",
+                               stage_numeric==2 ~ "2",
+                               stage_numeric==3 ~ "3_plus",
+                               stage_numeric==4 ~ "3_plus"))
+modData1$stage_new <- factor(modData1$stage_new, levels = c("1", "2", "3_plus"))
+class(modData1$stage_new)
+
+stage_dummies <- model.matrix(~ stage_new, data = modData1)[, -1]
+stage_dummies
+
+
+predictors <- modData1[, c("age_at_diagnosis", "gender_1", "p_Tumor", "p_Macrophage", "p_Cytotoxic_T", 
+                           "p_T_Helper", "p_B_Cell", "k_Tumor", "k_Cytotoxic_T", "k_B_Cell", "k_Macrophage", 
+                           "k_T_Helper", "k_Tumor_CytotoxicT", "k_Tumor_BCell", "k_Tumor_Macrophage", 
+                           "k_Tumor_THelper", "k_BCell_CytotoxicT", "k_BCell_Macrophage", "k_BCell_THelper", 
+                           "k_CytotoxicT_Macrophage", "k_CytotoxicT_THelper", "k_Macrophage_THelper")]
+
+# Combine predictors and dummy variables
+modData2 <- cbind(predictors, stage_dummies)
+names(modData2)
+```
+
+
+
+Kaplan Meier Curves for Lung Cancer Patients
+```{r data}
+
+range(filtered_modData$age_at_diagnosis)
+
+hist(filtered_modData$age_at_diagnosis)
+
+filtered_modData_surv <- filtered_modData %>%
+  mutate(age_group = case_when(
+    age_at_diagnosis < 60 ~ "<60",
+    age_at_diagnosis >= 60 & age_at_diagnosis < 70 ~ "60-69",
+    age_at_diagnosis >= 70 & age_at_diagnosis < 80 ~ "70-79",
+   age_at_diagnosis >= 80 ~ "80+"
+   ))
+
+
+
+lab_names<- c("<60", "60-69","70-79", "80+")
+
+#Kaplan Meier Curve
+km_fit <- survfit(
+  Surv(survival_days, survival_status) ~ age_group, data=filtered_modData_surv)
+
+library(RColorBrewer)
+display.brewer.all()
+
+kap_lung<-ggsurvplot(km_fit, 
+           size=1.5,
+           palette = "RdGy",  # Use "Blues" palette
+           title = "       Lung Cancer: Patient Survival by Age Group", 
+           risk.table =F,
+           #legend.labs = lab_names,
+           xlab="Time (days)",
+           legend.title="Age Group",
+           font.x = "bold",
+           font.y="bold",
+           font.title="bold",
+           pval=T)
+           #conf.int = TRUE)
+
+kap_lung
+
+
+barplot(table(filtered_modData_surv$age_group),
+        main = "Frequency of Categories",
+        xlab = "Category",
+        ylab = "Frequency",
+        col = "skyblue",
+        border = "black")
+
+
+# Extract the ggplot object from ggsurvplot
+kap_lung_plot <- kap_lung$plot
+
+# Save the plot using ggsave with the extracted ggplot object
+ggsave("kap_lung_survival_plot.png", plot = kap_lung_plot, width = 7, height = 6)
+
+
+
+?cut_number
+
+median=median(filtered_modData_surv$age_at_diagnosis)
+
+filtered_modData_surv <- filtered_modData %>%
+  mutate(age_group = case_when(
+    age_at_diagnosis < median ~ "group1",
+    age_at_diagnosis >= median ~ "group 2"
+   ))
+
+filtered_modData_surv$age_group
+#Kaplan Meier Curve
+km_fit <- survfit(
+  Surv(survival_days, survival_status) ~ age_group, data=filtered_modData_surv)
+
+
+kap_lung<-ggsurvplot(km_fit, 
+           size=1.5,
+           palette = "viridis",  # Use "Blues" palette
+           title = "       Lung Cancer: Patient Survival by Age Group", 
+           risk.table =F,
+           #legend.labs = lab_names,
+           xlab="Time (days)",
+           legend.title="Age Group",
+           font.x = "bold",
+           font.y="bold",
+           font.title="bold",
+           pval=T)
+           #conf.int = TRUE)
+
+kap_lung
+
+
+```
+
+
+Cox Model with Elastic Net for Lung Data
+
+Selected alpha and lambda values using cross validation
+
+alpha= 0.05
+lambda= 0.6727818
+```{r pressure, echo=FALSE}
+names(modData1)
+#define x values
+lung_k <- modData2 %>%
+  select(
+    age_at_diagnosis,
+    stage_new2,
+    stage_new3_plus,
+    gender_1,
+    p_Tumor,
+        p_Macrophage,
+        p_Cytotoxic_T,
+        p_T_Helper,
+        p_B_Cell,
+         k_Tumor,   
+         k_Cytotoxic_T,    
+        k_B_Cell,
+         k_Macrophage,
+         k_T_Helper,
+         k_Tumor_CytotoxicT,
+         k_Tumor_BCell, 
+         k_Tumor_Macrophage,
+         k_Tumor_THelper,
+         k_BCell_CytotoxicT,
+         k_BCell_Macrophage,
+         k_BCell_THelper,
+         k_CytotoxicT_Macrophage,
+         k_CytotoxicT_THelper,
+         k_Macrophage_THelper) %>%
+  filter(complete.cases(.))
+
+
+lung_k
+#takes it down to a sample size of 146/153
+
+
+#remove rows from total data set
+filtered_modData <- modData[complete.cases(modData %>%
+                                             select(p_Tumor,
+        p_Macrophage,
+        p_Cytotoxic_T,
+        p_T_Helper,
+        p_B_Cell,
+         k_Tumor,   
+         k_Cytotoxic_T,    
+        k_B_Cell,
+         k_Macrophage,
+         k_T_Helper,
+         k_Tumor_CytotoxicT,
+         k_Tumor_BCell, 
+         k_Tumor_Macrophage,
+         k_Tumor_THelper,
+         k_BCell_CytotoxicT,
+         k_BCell_Macrophage,
+         k_BCell_THelper,
+         k_CytotoxicT_Macrophage,
+         k_CytotoxicT_THelper,
+         k_Macrophage_THelper)), ] 
+
+
+#fit x and y matricies
+x <- as.matrix(lung_k)
+x
+
+y <- filtered_modData %>%
+  mutate(time=survival_days,
+         status=survival_status) %>%
+  select(time, status) %>%
+  as.matrix()
+y
+
+#-------------------------
+
+#choosing alpha for cox model
+cvm <- NULL
+alpha <- seq(0.05, 1, by = 0.05)
+lambda <- list()
+lambda_alphamin <- list()
+alpha.min <- NULL
+
+
+set.seed(1)
+for(j in 1:50){
+  foldid <- sample(1:10, size = nrow(y), replace = T)
+  for(i in 1:19){
+    a <- alpha[i]
+    enetMod.cv <- cv.glmnet(
+      x = x, y = y,
+      #weights = train$WTSA2YR, 
+      #foldid = foldid, 
+      alpha = a, 
+      #nfolds=10,
+      foldid=foldid, 
+      #added in line to make it cox
+      family="cox",
+      #added type.measure
+      type.measure = "deviance", 
+      #changed standardize from F to T
+      standardize = TRUE
+      #penalty.factor = c(rep(0, times = 10), rep(1, times = 29))
+    )
+    cvm[i] <- min(enetMod.cv$cvm)
+    lambda[[i]] <- c(enetMod.cv$lambda.min, enetMod.cv$lambda.1se)
+  }
+  alpha.min[j] <- alpha[which.min(cvm)]
+  lambda_alphamin[[j]] <- lambda[[which.min(cvm)]]
+  
+  print(j)
+}
+
+hist(alpha.min, breaks = seq(0, 1, by = 0.05))
+summary(alpha.min)
+table(alpha.min)
+
+
+### building cox model using chosen alpha
+
+# if we want to fix demographic variables and only select spatial features
+# set age and gender equal to 0 so that model does not penalize them
+#penalty_vars <- rep(1, ncol(x))
+#penalty_vars
+#penalty_vars[c(1, 2, 3)] <- 0
+
+
+#fit model
+cox_lung_fit <- glmnet(x, y, alpha=0.05, family = "cox", standardize = TRUE)
+
+#plot(fit)
+plot(cox_lung_fit)
+
+
+#selecting lambda value using cross validation
+set.seed(1)
+
+cvfit_lung_cox <- cv.glmnet(x, y, family = "cox", alpha=0.05, type.measure = "deviance", standardize = TRUE, nfolds=10)
+
+#plot cross validation
+plot(cvfit_lung_cox)
+
+
+# Extract lambda values
+lambda_min <- cvfit_lung_cox$lambda.min
+lambda_min
+
+set.seed(1)
+final_fit<-glmnet(x, y, alpha=0.05, lambda=lambda_min, family = "cox", standardize = TRUE)
+
+final<-coef(final_fit, standardize = TRUE)
+
+
+?glmnet
+
+pred = predict(final_fit, x, s = lambda_min)
+Cindex(pred, y, weights = rep(1, nrow(y)))
+
+
+#----------------
+
+
+
+
+
+
+```
+
+
+
+
+```{r}
+
+k_BCell_CytotoxicT_quantile_25 <- quantile(filtered_modData$k_BCell_CytotoxicT, probs = 0.25)
+k_BCell_CytotoxicT_quantile_50 <- quantile(filtered_modData$k_BCell_CytotoxicT, probs = 0.50)
+k_BCell_CytotoxicT_quantile_75 <- quantile(filtered_modData$k_BCell_CytotoxicT, probs = 0.75)
+k_BCell_CytotoxicT_quantile_25
+k_BCell_CytotoxicT_quantile_50
+
+
+
+names(filtered_modData)
+    filtered_modData   
+
+newData <- with(filtered_modData, data.frame(k_BCell_CytotoxicT = c(k_BCell_CytotoxicT_quantile_25,k_BCell_CytotoxicT_quantile_75),
+                                                
+  age_at_diagnosis = mean(age_at_diagnosis, na.rm = TRUE),
+  stage_new2 = 0,
+  stage_new3_plus = 0,
+  gender_1 = 0,
+  p_Tumor = mean(p_Tumor, na.rm = TRUE),
+  p_Macrophage = mean(p_Macrophage, na.rm = TRUE),
+  p_Cytotoxic_T = mean(p_Cytotoxic_T, na.rm = TRUE),
+  p_T_Helper = mean(p_T_Helper, na.rm = TRUE),
+  p_B_Cell = mean(p_B_Cell, na.rm = TRUE),
+  k_B_Cell = mean(k_B_Cell, na.rm = TRUE),
+  k_Macrophage = mean(k_Macrophage, na.rm = TRUE),
+  k_Cytotoxic_T = mean(k_Cytotoxic_T, na.rm = TRUE),
+  k_T_Helper = mean(k_T_Helper, na.rm = TRUE),
+  k_Tumor_CytotoxicT = mean(k_Tumor_CytotoxicT, na.rm = TRUE),
+  k_Tumor_BCell = mean(k_Tumor_BCell, na.rm = TRUE),
+  k_Tumor_Macrophage = mean(k_Tumor_Macrophage, na.rm = TRUE),
+  k_Tumor_THelper = mean(k_Tumor_THelper, na.rm = TRUE),
+  k_BCell_CytotoxicT = mean(k_BCell_CytotoxicT, na.rm = TRUE),
+  k_BCell_Macrophage = mean(k_BCell_Macrophage, na.rm = TRUE),
+  k_BCell_THelper = mean(k_BCell_THelper, na.rm = TRUE),
+  k_CytotoxicT_Macrophage = mean(k_CytotoxicT_Macrophage, na.rm = TRUE),
+  k_CytotoxicT_THelper = mean(k_CytotoxicT_THelper, na.rm = TRUE),
+  k_Macrophage_THelper = mean(k_Macrophage_THelper, na.rm = TRUE)
+))
+
+newData<-as.matrix(newData)
+newData
+
+fit <- predict(final_fit, newx = newData, type = "response")
+
+fit
+
+library(glmnet)
+library(survival)
+library(survminer)
+
+# Create survival plot
+ggsurvplot(final_fit)
+
+
+# , data = newData, 
+#            surv.median.line = "hv", # Display median survival time line
+#            risk.table = TRUE,      # Display risk table
+#            pval = TRUE,            # Show p-value of survival comparison
+#            conf.int = TRUE,        # Show confidence intervals
+#            ggtheme = theme_minimal())
+
+
+
+# Create a survfit object using predicted survival probabilities
+surv_obj <- Surv(time = filtered_modData$time, event = lung$status)
+
+names(filtered_modData)
+
+survfit_obj <- survfit(surv_obj ~ predicted_survival_probs)
+
+# Plot using ggsurvplot
+ggsurvplot(survfit_obj, conf.int = TRUE, legend.labs = c("Sex=1", "Sex=2"),
+           ggtheme = theme_minimal())
+
+
+
+
+
+# # Survival Curve plot by tumor cell clustering
+# #median_k_BCell_CytotoxicT<- median(filtered_modData$k_BCell_CytotoxicT)
+# 
+# filtered_modData_ovarian_2_median_tumor <- newData_ov %>%
+#   mutate(tumor_group = case_when(
+#     k_BCell_CytotoxicT< k_BCell_CytotoxicT_quantile_25 ~ "Below 25th Quantile",
+#     k_BCell_CytotoxicT >= k_BCell_CytotoxicT_quantile_25 &  k_BCell_CytotoxicT < k_BCell_CytotoxicT_quantile_50 ~ "Between 25th and 50th Quantiles",
+#     k_BCell_CytotoxicT>= k_BCell_CytotoxicT_quantile_50 &  k_BCell_CytotoxicT < k_BCell_CytotoxicT_quantile_75 ~ "Between 50th and 75th Quantiles",
+#     k_BCell_CytotoxicT > k_BCell_CytotoxicT_quantile_75 ~ "Above 75th"
+#   ))
+
+
+
+
+# x_group<- model.matrix(surv_obj ~ tumor_group, filtered_modData_ovarian_2_median_tumor)
+# x_group
+# 
+# final_fit<-glmnet(x_group, surv_obj, alpha=0.95, lambda=lambda_min, family = "cox", standardize = TRUE)
+# 
+# #final_fit<-glmnet(x_ov_CK_group, surv_obj, alpha=0.05, lambda=lambda_min, family = "cox", standardize = TRUE)
+# 
+# 
+# log_hr <- predict(final_fit, s = lambda_min, type = "link", newx = x_group)
+# cum_hazard <- exp(log_hr)
+# surv_prob <- exp(-cum_hazard)
+# surv_data <- data.frame(
+#   time = y_new$time,
+#   status = y_new$status,
+#   group = filtered_modData_ovarian_2_median_tumor$tumor_group,
+#   surv_prob = surv_prob
+# )
+# 
+# surv_data$group <- factor(surv_data$group)
+# 
+# surv_fit <- survfit(Surv(time, status) ~ group, data = surv_data)
+# 
+# plot(surv_fit, col = c("blue", "red", "green", "grey"), lty = 1:4, 
+#      xlab = "Time", ylab = "Survival Probability", 
+#      main = "Survival Curves by Lung Cancer Cell Clustering")
+# legend("topright", legend = levels(surv_data$group), col = c("blue", "red", "green", "grey"), lty = 1:3, cex = 0.8)
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# # Extra code
+# surv_prob <- exp(-pred)
+# surv_data <- data.frame(time = y_new$time, surv_prob = surv_prob)
+# 
+# surv_fit <- survfit(Surv(y_new$time, y_new$status) ~ 1, data = surv_data)
+# 
+# plot(surv_fit, xlab = "Time", ylab = "Survival Probability", main = "Survival Curves")
+
+
+
+```
+
+
+Check for multicollinearity
+```{r corr}
+library(corrplot)
+
+corr<-cor(lung_k, method="pearson")
+
+corrplot(corr, method="number", type="upper", )
+
+```
+
+
+
+AFT model for Lung Data
+
+alpha = 0.05
+lambda = 
+```{r aft}
+#mutate to log time
+ydf <- as.data.frame(y)
+logY <- ydf %>%
+  mutate(time = log(time),
+         status = status) 
+
+startT <- Sys.time()
+#select alpha using cross validation
+cvm <- NULL
+alpha <- seq(0.05, 1, by = 0.05)
+lambda <- list()
+lambda_alphamin <- list()
+alpha.min <- NULL
+
+set.seed(1)
+for(j in 1:300){
+  folds <- sample(1:10, nrow(y), replace = T)
+  foldid <- lapply(1:10, function(x){which(folds == x)})
+  for(i in 1:19){
+    a <- alpha[i]
+    enetMod.cv <- penAFT.cv(x_mat, logY$time, logY$status, 
+                           nlambda = 50,
+                           penalty = NULL,
+                           alpha=a,
+                           cv.index=foldid,
+                           standardize=T
+    )
+    cvm[i] <- min(enetMod.cv$cv.err.linPred)
+    lambda[i] <- enetMod.cv$lambda.min
+  }
+  alpha.min_aft[j] <- alpha[which.min(cvm)]
+  lambda_alphamin[j] <- lambda[which.min(cvm)]
+  
+  print(j)
+}
+Sys.time() - startT
+
+
+
+hist(alpha.min_aft, breaks = seq(0, 1, by = 0.05))
+summary(alpha.min_aft)
+alpha_freq_table_aft<-table(alpha.min_aft)
+
+alpha_freq_table_aft
+
+chosen_alpha<-which.max(alpha_freq_table_aft)
+alpha_with_max_freq<-names(alpha_freq_table_aft)[chosen_alpha]
+alpha_with_max_freq
+
+
+
+
+aft_fit_plot <- penAFT(x, logY$time, logY$status, 
+                           penalty = NULL,
+                       nlambda=50,
+                           alpha=0.05,
+                           lambda = NULL,
+                           standardize=T)
+penAFT.trace(aft_fit_plot)
+
+#chose 0.05
+
+set.seed(1)
+aft_mod_pen_aft<-penAFT.cv(x, logY$time, logY$status, 
+                           nlambda = 50,
+                           #penalty = EN,
+                           alpha=0.05,
+                           nfolds=10, 
+                           standardize=T)
+
+
+
+#refit model with lambda min
+aft_best_lambda<-aft_mod_pen_aft$lambda.min
+aft_best_lambda
+
+
+
+
+?penAFT
+
+# fit model using chosen alpha 
+aft_fit_final <- penAFT(x, logY$time, logY$status, 
+                           penalty = NULL,
+                           alpha=0.05,
+                           lambda = aft_best_lambda,
+                           standardize=T)
+
+
+
+
+coeff<-penAFT.coef(aft_fit_final, lambda = aft_best_lambda)
+coeff
+
+penAFT.plot(aft_mod_pen_aft)
+
+names<-c("age_at_diagnosis",
+"gender_1",
+"stage2",
+"stage3",
+"p_Tumor",
+"p_Macrophage",
+"p_Cytotoxic_T",
+"p_T_Helper",
+"p_B_Cell",
+"k_Tumor",   
+"k_Cytotoxic_T",    
+"k_B_Cell",
+"k_Macrophage",
+"k_T_Helper",
+"k_Tumor_CytotoxicT",
+"k_Tumor_BCell", 
+"k_Tumor_Macrophage",
+"k_Tumor_THelper",
+"k_BCell_CytotoxicT",
+"k_BCell_Macrophage",
+"k_BCell_THelper",
+"k_CytotoxicT_Macrophage",
+"k_CytotoxicT_THelper",
+"k_Macrophage_THelper")
+
+results <- data.frame(Variable = names, Coefficient = coeff)
+results
+
+
+
+
+
+coef_best_lambda <- penAFT.coef(aft_mod_pen_aft, lambda = "lambda.min")
+
+?penAFT.predict
+
+
+pred_aft = penAFT.predict(aft_fit_final, x, lambda = aft_best_lambda)
+Cindex(pred_aft, y, weights = rep(1, nrow(y)))
+
+
+
+
+
+
+
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
