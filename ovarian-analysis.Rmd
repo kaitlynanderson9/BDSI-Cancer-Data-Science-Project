@@ -1,0 +1,354 @@
+---
+title: "Ovarian Analysis"
+author: "Derek Yao"
+date: "2024-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r dat}
+
+library(survival)
+library(ranger)
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(survminer)
+library(glmnet)
+library(tidyr)
+library(rjags)
+library(afthd)
+library(penAFT)
+
+
+###
+ovarian_dat<-read.csv("/Users/derekyao/Documents/BDSI/Cancer Data Science/Data/newOvKData.csv")
+
+names(ovarian_dat)
+```
+
+
+Kaplan Meier Curve for Ovarian Patients
+```{r kaplan}
+#Kaplan Meier Curve for ovarian
+km_fit_ov <- survfit(
+  Surv(survival_time, death) ~ 1, data=ovarian_dat)
+  
+
+kap_ov<-ggsurvplot(km_fit_ov, 
+                     size=1.5,
+                     palette = "red",
+                     title = "Survival Curve for Ovarian Cancer Patients", 
+                     risk.table =T)
+
+kap_ov
+```
+
+
+
+Excluded variables that include CD19
+```{r prep}
+
+#define x values
+ovarian_k <- ovarian_dat %>%
+  select(age_at_diagnosis,
+         p_Tumor,
+         p_Cytotoxic_T,
+         p_Macrophage,
+         p_T_Helper,
+         k_Tumor,   
+         k_Cytotoxic_T,    
+         k_Macrophage,
+         k_T_Helper,
+         k_Tumor_CytotoxicT,
+         k_Tumor_Macrophage,
+         k_Tumor_THelper,
+         k_CytotoxicT_Macrophage,
+         k_CytotoxicT_THelper,
+         k_Macrophage_THelper,
+       ) %>%
+  filter(complete.cases(.))
+
+ovarian_k
+
+
+#remove rows from total data set
+filtered_modData_ovarian <- ovarian_dat[complete.cases(ovarian_dat %>%
+                                             select(p_Tumor,
+                                                    p_Cytotoxic_T,
+                                                    p_Macrophage,
+                                                    p_T_Helper,
+                                                    k_Tumor,   
+                                                    k_Cytotoxic_T,    
+                                                    k_Macrophage,
+                                                    k_T_Helper,
+                                                    k_Tumor_CytotoxicT,
+                                                    k_Tumor_Macrophage,
+                                                    k_Tumor_THelper,
+                                                    k_CytotoxicT_Macrophage,
+                                                    k_CytotoxicT_THelper,
+                                                    k_Macrophage_THelper
+                                                  )), ] 
+
+#fit
+x_ov <- as.matrix(ovarian_k)
+x_ov
+
+y_ov <- filtered_modData_ovarian %>%
+  mutate(time=survival_time,
+         status=death) %>%
+  select(time, status) %>%
+  as.matrix()
+y_ov
+```
+
+
+```{r}
+# Checking the PH assumption for Cox regression model
+coxfit = coxph(Surv(survival_time, death)~age_at_diagnosis+stage+
+                                                    p_Tumor+
+                                                    p_Cytotoxic_T+
+                                                    p_Macrophage+
+                                                    p_T_Helper+
+                                                    k_Tumor+  
+                                                    k_Cytotoxic_T+   
+                                                    k_Macrophage+
+                                                    k_T_Helper+
+                                                    k_Tumor_CytotoxicT+
+                                                    k_Tumor_Macrophage+
+                                                    k_Tumor_THelper+
+                                                    k_CytotoxicT_Macrophage+
+                                                    k_CytotoxicT_THelper+
+                                                    k_Macrophage_THelper, data=filtered_modData_ovarian)
+coxfit
+
+test.ph = cox.zph(coxfit)
+test.ph
+ggcox <- ggcoxzph(test.ph)
+print(ggcox)
+print(ggcox[[1]])
+print(ggcox[[2]])
+print(ggcox[[3]])
+print(ggcox[[4]])
+print(ggcox[[5]])
+print(ggcox[[6]])
+print(ggcox[[7]])
+print(ggcox[[8]])
+print(ggcox[[9]])
+print(ggcox[[10]])
+print(ggcox[[11]])
+print(ggcox[[12]])
+print(ggcox[[13]])
+print(ggcox[[14]])
+print(ggcox[[15]])
+print(ggcox[[16]])
+# According to the plots, all variables do not seem to violate the PH assumption
+```
+
+
+Cox Model for Ovarian Patients
+alpha= 0.35
+lamba = 0.07308709
+```{r fit}
+#Find alpha value
+
+
+cvm <- NULL
+alpha <- seq(0.05, 1, by = 0.05)
+lambda <- list()
+lambda_alphamin <- list()
+alpha.min <- NULL
+y_ov
+length(y_ov)
+
+set.seed(1)
+for(j in 1:200){
+  foldid <- sample(1:10, size = nrow(y_ov), replace = T)
+  for(i in 1:19){
+    a <- alpha[i]
+    enetMod.cv <- cv.glmnet(
+      x = x_ov, y = y_ov,
+      #nfolds=10,
+      #weights = train$WTSA2YR, 
+      foldid = foldid, 
+      alpha = a, 
+      #added in line to make it cox
+      family="cox",
+      #added type.measure
+      type.measure = "deviance", 
+      #changed standardize from F to T
+      standardize = TRUE
+      #penalty.factor = c(rep(0, times = 10), rep(1, times = 29))
+    )
+    cvm[i] <- min(enetMod.cv$cvm)
+    lambda[[i]] <- c(enetMod.cv$lambda.min, enetMod.cv$lambda.1se)
+  }
+  alpha.min[j] <- alpha[which.min(cvm)]
+  lambda_alphamin[[j]] <- lambda[[which.min(cvm)]]
+  
+  print(j)
+}
+
+
+hist(alpha.min, breaks = seq(0.05, 1, by = 0.05))
+summary(alpha.min)
+alpha_freq_table_cox <- table(alpha.min)
+
+chosen_alpha_cox <- which.max(alpha_freq_table_cox)
+alpha_with_max_freq_cox <- names(alpha_freq_table_cox)[chosen_alpha_cox]
+
+alpha_with_max_freq_cox
+
+# set age and gender equal to 0 so that model does not penalize them
+# penalty_vars <- rep(1, ncol(x_ov))
+# penalty_vars
+# penalty_vars[c(1, 2)] <- 0
+
+#fit model
+fit <- glmnet(x_ov, y_ov, family = "cox", alpha = alpha_with_max_freq_cox)
+plot(fit)
+
+#use alpha selected by for loop
+
+# Select lambda using cross-validation
+set.seed(1)
+cvfit_ov <- cv.glmnet(x_ov, y_ov, 
+                   family = "cox",
+                   alpha=alpha_with_max_freq_cox,
+                   type.measure = "deviance", 
+                   standardize = TRUE,
+                   nfolds=50) 
+                   #penalty.factor = penalty_vars)
+
+
+plot(cvfit_ov)
+
+# Extract lambda values
+lambda_min_ov <- cvfit_ov$lambda.min
+lambda_min_ov
+
+# Coefficients at best lambda - survival model
+out = glmnet(x_ov, y_ov, family = "cox", alpha = alpha_with_max_freq_cox, lambda = lambda_min_ov, type.measure = "deviance", standardize = TRUE)
+coef = coef(out, standarize = TRUE)
+coef
+
+
+
+
+```
+
+
+
+AFT Model for Ovarian Patients
+new alpha = 0.95 chosen 84 times out of 200
+new lambda = 0.06702621
+```{r aft}
+startT <- Sys.time()
+ydf_ov <- as.data.frame(y_ov)
+
+logY_ov <- ydf_ov %>%
+  mutate(time = log(time),
+         status = status) 
+
+
+cvm <- NULL
+alpha <- seq(0.05, 1, by = 0.05)
+lambda <- c()
+lambda_alphamin <- c()
+alpha.min_aft <- NULL
+
+set.seed(1)
+for(j in 1:200){
+  folds <- sample(1:10, nrow(ydf_ov), replace = T)
+  foldid <- lapply(1:10, function(x_ov){which(folds == x_ov)})
+  for(i in 1:19){
+    a <- alpha[i]
+    enetMod.cv <- penAFT.cv(x_ov, logY_ov$time, logY_ov$status, 
+                            nlambda = 50,
+                            penalty = NULL,
+                            alpha=a, cv.index = foldid,
+                            standardize=T)
+
+    cvm[i] <- min(enetMod.cv$cv.err.linPred)
+    # enetMod.cv$cvsd
+    lambda[i] <- enetMod.cv$lambda.min
+  }
+  alpha.min_aft[j] <- alpha[which.min(cvm)]
+  lambda_alphamin[j] <- lambda[which.min(cvm)]
+  
+  print(j)
+}
+
+hist(alpha.min_aft, breaks = seq(0.05, 1, by = 0.05))
+summary(alpha.min_aft)
+table(alpha.min_aft)
+
+alpha_freq_table_aft <- table(alpha.min_aft)
+
+chosen_alpha_aft <- which.max(alpha_freq_table_aft)
+alpha_with_max_freq_aft <- names(alpha_freq_table_aft)[chosen_alpha_aft]
+alpha_with_max_freq_aft
+
+# fit model using chosen alpha (need to fix)
+aft_fit_ov <- penAFT(x_ov, logY_ov$time, logY_ov$status,
+                           alpha=0.95)
+plot(aft_fit_ov)
+
+# Choose lambda using cross-validation
+set.seed(1)
+aft_mod_ov<-penAFT.cv(x_ov, logY_ov$time, logY_ov$status, 
+                           nlambda = 50,
+                           penalty = NULL,
+                           alpha=0.95, nfolds=5, 
+                           standardize=T)
+
+lambda_aft <- aft_mod_ov$lambda.min
+lambda_aft
+
+coeff_ov<-penAFT.coef(aft_mod_ov, lambda = NULL)
+coeff_ov
+
+penAFT.plot(aft_mod_ov)
+
+names_ov <-c("age_at_diagnosis",
+             "p_Tumor",
+             "p_Cytotoxic_T",
+             "p_Macrophage",
+             "p_T_Helper",
+             "k_Tumor",
+             "k_Cytotoxic_T",
+             "k_Macrophage",
+             "k_T_Helper",
+             "k_Tumor_CytotoxicT",
+             "k_Tumor_Macrophage",
+             "k_Tumor_THelper",
+             "k_CytotoxicT_Macrophage",
+             "k_CytotoxicT_THelper",
+             "k_Macrophage_THelper")
+
+
+
+ov_aft_best_lambda<-aft_mod_ov$lambda.min
+ov_aft_best_lambda
+
+coeff_best_lambda_ov<-penAFT.coef(aft_mod_ov, lambda = ov_aft_best_lambda)
+coeff_best_lambda_ov
+
+
+
+
+final_results_ovarian <- data.frame(Variable = names_ov, Coefficient = coeff_best_lambda_ov)
+final_results_ovarian
+
+Sys.time() - startT
+```
+
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
